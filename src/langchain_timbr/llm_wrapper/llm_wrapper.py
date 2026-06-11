@@ -17,6 +17,8 @@ class LlmTypes(Enum):
   VertexAI = 'chat-vertexai'
   Bedrock = 'amazon_bedrock_converse_chat'
   Timbr = 'timbr'
+  Ollama = 'ollama'
+  
 
 
 class LlmWrapper(LLM):
@@ -285,6 +287,30 @@ class LlmWrapper(LLM):
         model=llm_model,
         **params,
       )
+      
+    elif is_llm_type(llm_type, LlmTypes.Ollama):
+      from langchain_ollama import ChatOllama
+
+      llm_model = model or "llama3.2"
+
+      params = self._add_temperature(
+        LlmTypes.Ollama.name,
+        llm_model,
+        **llm_params,
+      )
+
+      # Optional custom Ollama server
+      base_url = pop_param_value(
+        params,
+        ['ollama_base_url', 'base_url', 'ollama_url'],
+        default="http://localhost:11434/"
+      )
+
+      return ChatOllama(
+        model=llm_model,
+        temperature=0.1,
+        **params,
+      )
     else:
       raise ValueError(f"Unsupported LLM type: {llm_type}")
 
@@ -382,7 +408,22 @@ class LlmWrapper(LLM):
         )
         response = bedrock_client.list_foundation_models()
         models = [model['modelId'] for model in response.get('modelSummaries', [])]
+      
+      elif is_llm_type(self._llm_type, LlmTypes.Ollama):
+        import requests
 
+        base_url = getattr(
+          self.client,
+          'base_url',
+          'http://localhost:11434'
+        )
+
+        response = requests.get(f"{base_url}/api/tags")
+
+        if response.status_code == 200:
+          data = response.json()
+          models = [m['name'] for m in data.get('models', [])]
+          
     except Exception:
       # If model list fetching throws an exception, return default value using get_supported_models
       if hasattr(self, '_llm_type'):
