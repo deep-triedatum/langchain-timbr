@@ -26,7 +26,28 @@ from .prompt_service import (
     get_generate_sql_reasoning_prompt_template,
     get_qa_prompt_template
 )
+from .memory import apply_memory_question_expansion
+from ..kbclient import RuleSet, render_object_rules
 from .. import config
+from .. import ontology_metadata
+from .. import identify_concept_context
+
+# Target types that share the concept/view/cube rule bucket. Rules are looked up
+# by name across these types, so exact concept-vs-view discrimination isn't needed
+# at each injection site.
+_CVC_TYPES = ("concept", "view", "cube")
+
+
+def _append_rules_subblock(text: str, rules_txt: str) -> str:
+    """Append a rendered rules sub-block under an existing rendered line.
+
+    No-op (returns ``text`` unchanged) when ``rules_txt`` is empty, which keeps
+    prompts byte-identical when no rules apply.
+    """
+    if not rules_txt:
+        return text
+    indented = "\n".join("  " + line for line in rules_txt.split("\n"))
+    return text + "\n" + indented
 
 def _clean_snowflake_prompt(prompt: Any) -> None:
     import re
@@ -159,6 +180,13 @@ def _get_response_text(response: Any) -> str:
         response_text = response
     else:
         raise ValueError("Unexpected response format from LLM.")
+
+    # Some provider response shapes (e.g. a list of content parts with no
+    # `type == 'text'` item, or a null content) leave no usable text. Return an
+    # empty string so callers can treat it as "no answer" instead of crashing on
+    # a None membership check / .strip().
+    if response_text is None:
+        return ''
 
     if "QUESTION VALIDATION ERROR:" in response_text:
         err = response_text.split("QUESTION VALIDATION ERROR:", 1)[1].strip()
@@ -295,6 +323,8 @@ def determine_concept(
     debug: Optional[bool] = False,
     timeout: Optional[int] = None,
     memory_context=None,
+    enable_ontology_questions: Optional[bool] = False,
+    rules: Optional[RuleSet] = None,
 ) -> dict[str, Any]:
     _determine_concept_start = datetime.now()
     usage_metadata = {}
@@ -361,6 +391,7 @@ def determine_concept(
                 formatted_ontology_desc += f". Related Domains description: {cleaned_domain_desc}"
             concepts_desc_arr.append(formatted_ontology_desc + "\n")
 
+            legacy_item_lines = []
             for item in concepts_and_views.values():
                 item_name = item.get('concept')
                 item_desc = item.get('description')
@@ -384,14 +415,59 @@ def determine_concept(
                     concept_verbose += f" [tags: {item_tags}]"
                     concepts_and_views[item_name]['tags'] = f"- Annotations and constraints: {item_tags}\n"
 
-                concepts_desc_arr.append(concept_verbose)
-            
+                # KB rules: concept/view/cube SELECTION_RULE, inline under the line.
+                if rules is not None:
+                    concept_verbose = _append_rules_subblock(
+                        concept_verbose,
+                        render_object_rules(rules.rules_for(item_name, _CVC_TYPES, {"selection"})),
+                    )
+
+                legacy_item_lines.append(concept_verbose)
+
+
+            if enable_ontology_questions:
+                if len(ontologies_conn_params) > 1:
+                    concepts_desc_arr.append(ontology_metadata.prompt_lines({"enable_ontology_questions": True}, ontology))
+                else:
+                    concepts_desc_arr.append(ontology_metadata.prompt_lines({"enable_ontology_questions": True}))
+
+            # Identify-concept context builder: render a hierarchical, signal-rich
+            # catalog of the (already-filtered, candidate-registered) concepts/views.
+            # Candidate registration + the `tags` side-effect above are untouched, so
+            # the never-drop invariant holds no matter which render path runs. Any
+            # failure falls back to the legacy flat lines for this ontology.
+            builder_prefix = f"`{ontology}`." if len(ontologies_conn_params) > 1 else ""
+            if config.enable_identify_concept_context:
+                try:
+                    concepts_desc_arr.extend(
+                        identify_concept_context.build_catalog_lines(
+                            question=question,
+                            conn_params=ontologies_conn_params[ontology],
+                            concepts_and_views=concepts_and_views,
+                            tags=tags,
+                            prefix=builder_prefix,
+                            rules=rules,
+                        )
+                    )
+                except Exception:
+                    concepts_desc_arr.extend(legacy_item_lines)
+            else:
+                concepts_desc_arr.extend(legacy_item_lines)
+
             concepts_desc_arr.append('\n')
 
     if len(ontologies_concepts_and_views) == 0:
         raise Exception("No relevant concepts found for the query.")
 
-    if len(ontologies_concepts_and_views) == 1 and len(list(ontologies_concepts_and_views.values())[0]) == 1:
+    # Offer the virtual `ontology_metadata` concept as a first-class selectable option.
+    if enable_ontology_questions:
+        _multi_ontology = len(ontologies_conn_params) > 1
+        for _ont in ontologies_concepts_and_views.keys():
+            candidates.append((f"{_ont}." if _multi_ontology else "") + ontology_metadata.META)
+
+    is_metadata_question = False
+
+    if not enable_ontology_questions and len(ontologies_concepts_and_views) == 1 and len(list(ontologies_concepts_and_views.values())[0]) == 1:
         # If only one concept is provided, return it directly
         determined_concept_name = list(list(ontologies_concepts_and_views.values())[0].keys())[0]
     else:
@@ -402,7 +478,7 @@ def determine_concept(
             iteration += 1
             err_txt = f"\nLast try got an error: {error}" if error else ""
             prompt = determine_concept_prompt.format_messages(
-                question=question.strip(),
+                question=apply_memory_question_expansion(question.strip(), memory_context, preserve_previous_anchor=True),
                 concepts="\n".join(concepts_desc_arr),
                 note=(note or '') + err_txt,
             )
@@ -434,15 +510,27 @@ def determine_concept(
             try:
                 parsed_response = _parse_json_from_llm_response(response)
                 if isinstance(parsed_response, dict) and 'result' in parsed_response:
-                    candidate = parsed_response.get('result', '').strip().replace("`", "").replace('"', "").lower()
+                    raw_candidate = parsed_response.get('result')
                     identify_concept_reason = parsed_response.get('reason', None)
+                    is_metadata_question = parsed_response.get('is_metadata_question', False)
                 else:
                     # Fallback to plain text if JSON doesn't have expected structure
-                    candidate = _get_response_text(response).strip().replace("`", "").replace('"', "").lower()
+                    raw_candidate = _get_response_text(response)
             except (json.JSONDecodeError, ValueError):
                 # If not JSON, treat as plain text (backwards compatibility)
-                candidate = _get_response_text(response).strip().replace("`", "").replace('"', "").lower()
-            
+                raw_candidate = _get_response_text(response)
+
+            # The model returns null/empty result when no concept matches the question, and
+            # some provider response shapes make _get_response_text return None. Treat all of
+            # these as "no concept identified": retry with a clear error instead of crashing
+            # on .strip().
+            if not isinstance(raw_candidate, str) or not raw_candidate.strip():
+                reason_txt = f" Reason: {identify_concept_reason}" if identify_concept_reason else ""
+                error = f"The model could not identify a relevant concept for the question.{reason_txt}"
+                continue
+
+            candidate = raw_candidate.strip().replace("`", "").replace('"', "").lower()
+
             if candidate not in candidates:
 
                 if len(ontologies_conn_params) > 1:
@@ -459,6 +547,33 @@ def determine_concept(
 
         if determined_concept_name is None and error != '':
             raise Exception(f"Failed to determine concept: {error}")
+
+    if enable_ontology_questions and not ontology_metadata.is_metadata_concept(determined_concept_name) and is_metadata_question:
+        if "." in determined_concept_name:
+            determined_concept_ontology = determined_concept_name.split(".")[0]
+            determined_concept_name = determined_concept_ontology + "." + ontology_metadata.META
+        else:
+            determined_concept_name = ontology_metadata.META
+        
+    # Short-circuit for the virtual metadata concept: it has no concept_metadata row,
+    # so return early before the concept/view schema lookup below would dereference it.
+    if ontology_metadata.is_metadata_concept(determined_concept_name):
+        _meta_ontology = ontology_metadata.parse_ontology(
+            determined_concept_name,
+            default=list(ontologies_concepts_and_views.keys())[0],
+        )
+        return {
+            "concept_metadata": None,
+            "concept": ontology_metadata.META,
+            "identify_concept_reason": identify_concept_reason,
+            "schema": schema,
+            "usage_metadata": usage_metadata,
+            "ontology": _meta_ontology,
+            "conn_params": ontologies_conn_params.get(
+                _meta_ontology, list(ontologies_conn_params.values())[0]
+            ),
+            "duration_ms": int((datetime.now() - _determine_concept_start).total_seconds() * 1000),
+        }
 
     ontology = list(ontologies_concepts_and_views.keys())[0]
     concepts_and_views = list(ontologies_concepts_and_views.values())[0]
@@ -602,10 +717,35 @@ def _partition_static_relationships_by_prefix(
     return new_dict
 
 
+_RULE_META_LABELS = (
+    ("selection", "selection_rules"),
+    ("instruction", "instructions"),
+    ("validation", "validation_rules"),
+)
+
+
+def _rule_meta_items(rules, name, target_types, kinds) -> list:
+    """Return ``label: text`` meta items for one object's rules (inline style).
+
+    Empty when ``rules`` is None or no rule matches — so the surrounding
+    rendering is byte-identical when no rules apply.
+    """
+    if rules is None:
+        return []
+    got = rules.rules_for(name, target_types, kinds)
+    return [
+        f"{label}: {'; '.join(got[kind])}"
+        for kind, label in _RULE_META_LABELS
+        if got.get(kind)
+    ]
+
+
 def _build_columns_str(
     columns: list[dict],
     columns_tags: Optional[dict] = {},
     exclude: Optional[list] = None,
+    rules=None,
+    target_type: Optional[str] = None,
 ) -> str:
     columns_desc_arr = []
     for col in columns:
@@ -638,6 +778,16 @@ def _build_columns_str(
         if statistics:
             col_meta.append(f"statistics: {statistics}")
 
+        # KB rules (property/measure): SELECTION_RULE + INSTRUCTION + VALIDATION,
+        # inline per-object. No-op when rules is None or target_type unset.
+        if rules is not None and target_type:
+            col_meta.extend(
+                _rule_meta_items(
+                    rules, col_name, (target_type,),
+                    ("selection", "instruction", "validation"),
+                )
+            )
+
         col_meta_str = ', '.join(col_meta) if col_meta else ''
         if col_meta_str:
             col_meta_str = f" ({col_meta_str})"
@@ -647,7 +797,7 @@ def _build_columns_str(
     return ", ".join(columns_desc_arr) if columns_desc_arr else ''
 
 
-def _build_rel_columns_str(relationships: list[dict], columns_tags: Optional[dict] = {}, exclude_properties: Optional[list] = None) -> str:
+def _build_rel_columns_str(relationships: list[dict], columns_tags: Optional[dict] = {}, exclude_properties: Optional[list] = None, rules=None) -> str:
     if not relationships:
         return ''
     rel_str_arr = []
@@ -657,14 +807,23 @@ def _build_rel_columns_str(relationships: list[dict], columns_tags: Optional[dic
         rel_description = f" which described as \"{rel_description}\"" if rel_description else ""
         rel_columns = rel.get('columns', [])
         rel_measures = rel.get('measures', [])
-        
+
         if rel_columns:
             joined_columns_str = _build_columns_str(rel_columns, columns_tags=columns_tags, exclude=exclude_properties)
             rel_str_arr.append(f"- The following columns are part of {rel_name} relationship{rel_description}, and must be used as is wrapped with quotes: {joined_columns_str}")
         if rel_measures:
             joined_measures_str = _build_columns_str(rel_measures, columns_tags=columns_tags, exclude=exclude_properties)
             rel_str_arr.append(f"- {MEASURES_DESCRIPTION}, are part of {rel_name} relationship{rel_description}: {joined_measures_str}")
-    
+
+        # KB rules (relationship): SELECTION_RULE + INSTRUCTION + VALIDATION,
+        # inline per relationship. No-op when the relationship has no rules.
+        rel_rule_items = _rule_meta_items(
+            rules, rel_name, ("relationship",),
+            ("selection", "instruction", "validation"),
+        )
+        if rel_rule_items:
+            rel_str_arr.append(f"- Rules for {rel_name} relationship: {'; '.join(rel_rule_items)}")
+
     return '.\n'.join(rel_str_arr) if rel_str_arr else ''
 
 
@@ -762,6 +921,7 @@ def _append_reasoning_context_blocks(
     note: Optional[str] = None,
     generate_sql_reason: Optional[str] = None,
     decisions: Optional[list] = None,
+    validation_rules: Optional[str] = None,
 ) -> None:
     """
     Append context blocks (note, generator reasoning, decision trace) to the
@@ -788,6 +948,9 @@ def _append_reasoning_context_blocks(
         # decisions is a list (parser already validated shape)
         decisions_str = json.dumps(decisions, indent=2)
         blocks.append(f"**Generated SQL Decision Trace:**\n{decisions_str}")
+
+    if validation_rules and validation_rules.strip():
+        blocks.append(f"**Knowledge Base Validation Rules:**\n{validation_rules.strip()}")
 
     if not blocks:
         return
@@ -818,6 +981,9 @@ def _evaluate_sql_enable_reasoning(
     note: Optional[str] = None,
     generate_sql_reason: Optional[str] = None,
     decisions: Optional[list] = None,
+    memory_context=None,
+    rules=None,
+    concept: Optional[str] = None,
 ) -> dict:
     """
     Evaluate if the generated SQL correctly answers the business question.
@@ -833,7 +999,7 @@ def _evaluate_sql_enable_reasoning(
     """
     generate_sql_reasoning_template = get_generate_sql_reasoning_prompt_template(conn_params)
     prompt = generate_sql_reasoning_template.format_messages(
-        question=question.strip(),
+        question=apply_memory_question_expansion(question.strip(), memory_context),
         sql_query=sql_query.strip(),
     )
 
@@ -842,6 +1008,10 @@ def _evaluate_sql_enable_reasoning(
         note=note,
         generate_sql_reason=generate_sql_reason,
         decisions=decisions,
+        validation_rules=(
+            render_object_rules(rules.rules_for(concept, _CVC_TYPES, {"validation"}))
+            if rules is not None and concept else ""
+        ),
     )
 
     apx_token_count = _calculate_token_count(llm, prompt)
@@ -990,6 +1160,8 @@ def _apply_dynamic_metadata_context(
     tc_topup=None,
     tc_seen_names: set | None = None,
     properties_desc: dict | None = None,
+    memory_context=None,
+    rules: Optional[RuleSet] = None,
 ) -> tuple[str, str, str, str | None]:
     """Decide static vs dynamic and return possibly-rebuilt context strings.
 
@@ -1000,12 +1172,10 @@ def _apply_dynamic_metadata_context(
     static strings unchanged and ``effective_anchor=None`` (backward-compat).
     """
     from ..ontology_context import (
-        EdgeIndex,
         MetadataContextConfig,
         build_filtered_metadata,
         config_from_module,
         get_shared_ontology,
-        should_skip_static_build,
     )
     from ..ontology_context.context_builder.rebuild import (
         apply_transitivity_overrides,
@@ -1018,29 +1188,10 @@ def _apply_dynamic_metadata_context(
     )
 
     # Trigger decision -----------------------------------------------------
-    static_token_count = _count_metadata_tokens(
-        static_columns_str, static_measures_str, static_rel_prop_str
-    )
-
-    should_run_dynamic = False
-    if mode == "dynamic":
-        should_run_dynamic = True
-    elif mode == "auto":
-        # Fast-path heuristic uses the edge_index, which requires an Ontology.
-        # Build lazily; only construct if either trigger might fire.
-        if static_token_count > cfg.metadata_context_max_tokens:
-            should_run_dynamic = True
-        elif graph_depth >= 3:
-            try:
-                ontology = get_shared_ontology(conn_params)
-                edge_index = EdgeIndex(ontology)
-                if should_skip_static_build(graph_depth, anchor, edge_index, cfg):
-                    should_run_dynamic = True
-            except Exception:
-                # Fast-path probe failed — keep static.
-                pass
-
-    if not should_run_dynamic:
+    # Only 'dynamic' runs the pipeline; 'static' is a strict no-op that returns
+    # the pre-computed strings unchanged. cfg.mode is already normalized by
+    # config_from_module (the retired 'auto' value is coerced to 'dynamic').
+    if cfg.mode != "dynamic":
         return static_columns_str, static_measures_str, static_rel_prop_str, None
 
     # Memoize the entire pipeline result for this (question, anchor, graph_depth)
@@ -1082,10 +1233,12 @@ def _apply_dynamic_metadata_context(
         config=cfg,
         graph_depth=graph_depth,
         note=note,
+        memory_context=memory_context,
+        rules=rules,
     )
     # Helper to apply overrides to whichever strings we end up returning. The
     # override is question-driven (depth requested by user) and should ALWAYS
-    # apply when the LLM emitted valid overrides — even on static-fallback paths.
+    # apply when the LLM emitted valid overrides.
     def _with_overrides(cols: str, meas: str, rels: str):
         if result.accepted_overrides:
             cols = apply_transitivity_overrides(cols, result.accepted_overrides)
@@ -1096,30 +1249,22 @@ def _apply_dynamic_metadata_context(
     import logging as _logging
     _log = _logging.getLogger(__name__)
 
-    # Only fall back to STATIC when the pipeline genuinely failed. The
-    # anchor-only, BFS-rescue, and depth-capped branches all own their own
-    # rebuilds (with possibly-empty validated_paths in the anchor-only case);
-    # only the last-resort 'empty' enum value — anchor with no neighbors at
-    # the depth cap — routes here. See .claude/plans/retry-fallback-redesign.md.
+    # In dynamic mode the pipeline NEVER reverts to the static (full,
+    # unfiltered) strings. Every no-validated-paths outcome — anchor-only,
+    # depth-capped, disconnected anchor ('empty'), or a handled pipeline error
+    # — flows through the rebuild below, which emits the anchor's
+    # columns/measures with a relationships block that is either empty (the
+    # prompt was NOT cascade-trimmed, so we trust the planner's "no joins")
+    # or a token-gated 1-hop safety net (the prompt WAS trimmed — see the
+    # depth-1 gate near the end). The only static path left is the call-site
+    # crash guard for an unexpected Python exception.
     resolved_by = (result.stats or {}).get("resolved_by")
-    if result.error or resolved_by == "empty":
-        # Pipeline failed or anchor was truly disconnected — fall back to
-        # static, but still apply any LLM-emitted overrides (depth
-        # requirements survive fallback).
+    if result.error:
         _log.warning(
-            "Dynamic metadata-context falling back to STATIC: error=%r "
-            "resolved_by=%r validated_paths=%d. SQL-gen will see the full "
-            "unfiltered relationships — expect a large prompt.",
+            "Dynamic metadata-context pipeline error (%r); emitting lean "
+            "anchor-only output (no relationships), NOT static.",
             result.error,
-            resolved_by,
-            len(result.validated_paths or []),
         )
-        cols, meas, rels = _with_overrides(
-            static_columns_str, static_measures_str, static_rel_prop_str
-        )
-        entry = (cols, meas, rels, result.effective_anchor)
-        ontology.set_filtered_cache(cache_key, entry)
-        return entry
 
     # Rebuild filtered strings ----------------------------------------------
     # ALL direct properties + measures for the anchor (flat columns/measures
@@ -1140,8 +1285,13 @@ def _apply_dynamic_metadata_context(
     if reanchored:
         from ..ontology_context.context_builder.rebuild import build_anchor_columns
         columns, measures = build_anchor_columns(ontology, effective_anchor_for_rebuild)
-    filtered_columns = filter_columns_for_concepts(columns, result.filtered_concepts)
-    filtered_measures = filter_columns_for_concepts(measures, result.filtered_concepts)
+    # Always keep the anchor's columns/measures. On a hard pipeline error
+    # filtered_concepts is empty; fall back to the anchor so its flat columns
+    # survive (an empty set would otherwise rely on filter_columns_for_concepts'
+    # pass-through behavior — make the intent explicit and future-proof).
+    concepts_for_filter = result.filtered_concepts or {effective_anchor_for_rebuild}
+    filtered_columns = filter_columns_for_concepts(columns, concepts_for_filter)
+    filtered_measures = filter_columns_for_concepts(measures, concepts_for_filter)
     filtered_relationships = build_relationships_from_paths(
         result.validated_paths, ontology, anchor=effective_anchor_for_rebuild,
     )
@@ -1223,35 +1373,25 @@ def _apply_dynamic_metadata_context(
         _inject_descriptions_into_flat(filtered_measures, properties_desc)
 
     new_columns_str = _build_columns_str(
-        filtered_columns, columns_tags=tags, exclude=exclude_properties
+        filtered_columns, columns_tags=tags, exclude=exclude_properties,
+        rules=rules, target_type="property",
     )
     new_measures_str = _build_columns_str(
-        filtered_measures, tags, exclude=exclude_properties
+        filtered_measures, tags, exclude=exclude_properties,
+        rules=rules, target_type="measure",
     )
     new_rel_prop_str = _build_rel_columns_str(
         filtered_relationships,
         columns_tags=tags,
         exclude_properties=exclude_properties,
+        rules=rules,
     )
 
-    # Empty-rebuild safety net: with the constructor approach, the only way
-    # filtered_relationships is empty is if every validated path had zero
-    # segments (defense-in-depth; the upstream `not validated_paths` guard
-    # already covers the normal cases). Fall back to static if static had
-    # content to offer.
-    if not filtered_relationships and (static_rel_prop_str or "").strip():
-        _log.warning(
-            "Dynamic metadata-context falling back to STATIC (constructor "
-            "produced empty rebuild). validated_paths=%d path_rel_keys=%s",
-            len(result.validated_paths),
-            sorted({rel for _f, rel, _t in result.path_rel_keys}),
-        )
-        cols, meas, rels = _with_overrides(
-            static_columns_str, static_measures_str, static_rel_prop_str
-        )
-        entry = (cols, meas, rels, result.effective_anchor)
-        ontology.set_filtered_cache(cache_key, entry)
-        return entry
+    # Empty filtered_relationships is now an INTENDED output (anchor-only when
+    # the planner chose no joins, or the degraded 1-hop safety net dropped by
+    # the token gate below). It is NOT a failure — emit the anchor's
+    # columns/measures with an empty relationships block; never revert to
+    # static. (Previously a safety net reverted to static here.)
 
     # Apply LLM-chosen transitivity overrides to ALL three strings BEFORE the
     # hard-ceiling check. Bakes the requested depth into the SQL-gen prompt.
@@ -1306,6 +1446,7 @@ def _apply_dynamic_metadata_context(
                     filtered_relationships,
                     columns_tags=tags,
                     exclude_properties=exclude_properties,
+                    rules=rules,
                 )
                 new_rel_prop_str = apply_transitivity_overrides(
                     new_rel_prop_str, result.accepted_overrides,
@@ -1327,25 +1468,38 @@ def _apply_dynamic_metadata_context(
                     soft_size, cfg.metadata_context_max_tokens,
                 )
 
-    # Per the "dynamic-over-budget is preferred over static-but-much-larger"
-    # principle (see .claude/plans/budget-knobs-cleanup.md): there is NO hard-
-    # revert to static when the rebuilt output is still over the soft cap
-    # after cascade + waypoint filter. Log a warning and emit the rebuilt
-    # strings as-is — the SQL-gen prompt is still SMALLER than the static
-    # alternative would have been on a graph_depth-3 ontology.
     new_token_count = _count_metadata_tokens(
         new_columns_str, new_measures_str, new_rel_prop_str
     )
     if new_token_count > cfg.metadata_context_max_tokens:
-        _log.warning(
-            "Dynamic metadata-context still over soft cap after cascade + "
-            "waypoint filter (%d > %d). Emitting rebuilt strings as-is — "
-            "no revert to static. resolved_by=%s, validated_paths=%d.",
-            new_token_count,
-            cfg.metadata_context_max_tokens,
-            (result.stats or {}).get("resolved_by"),
-            len(result.validated_paths or []),
-        )
+        if resolved_by == "depth_capped_static":
+            # Degraded no-paths safety net: the planner chose no joins from a
+            # cascade-trimmed prompt, so we synthesized a 1-hop slice. It does
+            # NOT fit the budget — drop the relationships entirely and keep
+            # only the anchor's columns/measures. (Still never static.)
+            _log.info(
+                "Dynamic metadata-context: degraded 1-hop safety net over "
+                "budget (%d > %d) — dropping relationships, keeping anchor "
+                "columns/measures.",
+                new_token_count, cfg.metadata_context_max_tokens,
+            )
+            new_rel_prop_str = ""
+        else:
+            # Principle: dynamic-over-budget is preferred over static-but-much-larger
+            # (see .claude/plans/budget-knobs-cleanup.md). There is NO hard-revert
+            # to static for the real-paths case when the rebuilt output is still
+            # over the soft cap after cascade + waypoint filter. Log and emit the
+            # rebuilt strings as-is — the SQL-gen prompt is still SMALLER than the
+            # static alternative.
+            _log.warning(
+                "Dynamic metadata-context still over soft cap after cascade + "
+                "waypoint filter (%d > %d). Emitting rebuilt strings as-is — "
+                "no revert to static. resolved_by=%s, validated_paths=%d.",
+                new_token_count,
+                cfg.metadata_context_max_tokens,
+                resolved_by,
+                len(result.validated_paths or []),
+            )
 
     entry = (
         new_columns_str,
@@ -1401,6 +1555,12 @@ def _build_sql_generation_context(
     # filter / pre-filter / anchor-reeval / not_needed-verifier all see the
     # same prior-turn context the SQL-gen prompt sees.
     note: Optional[str] = None,
+    # Conversation memory object — folds the expanded-intent summary into the
+    # question for the dynamic pre-filter / filter prompts (parallel to note).
+    memory_context=None,
+    # KB rules threaded into the dynamic pre-filter / filter prompts and into the
+    # per-object rendering below. None ⇒ no rules injected (backward-compat).
+    rules: Optional[RuleSet] = None,
 ) -> dict:
     """
     Prepare the complete SQL generation context by gathering all necessary metadata.
@@ -1522,16 +1682,17 @@ def _build_sql_generation_context(
         except Exception:
             pass  # Technical context failure must not break SQL generation
 
-    columns_str = _build_columns_str(columns, columns_tags=tags, exclude=exclude_properties)
-    measures_str = _build_columns_str(measures, tags, exclude=exclude_properties)
-    rel_prop_str = _build_rel_columns_str(relationships, columns_tags=tags, exclude_properties=exclude_properties)
+    columns_str = _build_columns_str(columns, columns_tags=tags, exclude=exclude_properties, rules=rules, target_type="property")
+    measures_str = _build_columns_str(measures, tags, exclude=exclude_properties, rules=rules, target_type="measure")
+    rel_prop_str = _build_rel_columns_str(relationships, columns_tags=tags, exclude_properties=exclude_properties, rules=rules)
 
     # --- Plan 2 — dynamic metadata-context (safe, opt-in) -----------------
     # Schema gate: dtimbr only; non-dtimbr schemas (vtimbr views/cubes) skip.
     # Mode gate: 'static' is a strict no-op (initial release default).
     # Errors anywhere inside this block fall back to the static strings above.
-    _dynamic_mode = (metadata_context_mode or config.metadata_context_mode or 'static').lower()
-    if schema == 'dtimbr' and _dynamic_mode in ('auto', 'dynamic'):
+    from ..ontology_context import normalize_mode
+    _dynamic_mode = normalize_mode(metadata_context_mode or config.metadata_context_mode)
+    if schema == 'dtimbr' and _dynamic_mode == 'dynamic':
         try:
             (
                 _new_columns_str,
@@ -1551,12 +1712,14 @@ def _build_sql_generation_context(
                 static_columns_str=columns_str,
                 static_measures_str=measures_str,
                 static_rel_prop_str=rel_prop_str,
+                memory_context=memory_context,
                 llm=llm,
                 note=note or '',
                 tc_annotations=tc_annotations,
                 tc_topup=tc_topup,
                 tc_seen_names=tc_seen_names,
                 properties_desc=properties_desc,
+                rules=rules,
                 config_overrides=dict(
                     metadata_context_max_tokens=metadata_context_max_tokens,
                     max_graph_depth=max_graph_depth,
@@ -1601,6 +1764,10 @@ def _build_sql_generation_context(
     ) if relationships else False
     
     concept_description = f"- Description: {concept_metadata.get('description')}\n" if concept_metadata and concept_metadata.get('description') else ""
+    # KB rules (concept/view/cube): INSTRUCTION + VALIDATION only — SELECTION_RULE
+    # was already applied upstream in identify/prefilter. Inline under the concept.
+    for _item in _rule_meta_items(rules, concept, _CVC_TYPES, ("instruction", "validation")):
+        concept_description += f"- {_item}\n"
     concept_tags = concept_metadata.get('tags') if concept_metadata and concept_metadata.get('tags') else ""
     
     cur_date = datetime.now().strftime("%Y-%m-%d")
@@ -1633,6 +1800,7 @@ def _generate_sql_with_llm(
     note: str,
     timeout: int,
     debug: bool = False,
+    memory_context=None,
 ) -> dict:
     """
     Generate SQL using LLM based on the provided context and note.
@@ -1654,7 +1822,7 @@ def _generate_sql_with_llm(
         concept=f"`{current_context['concept']}`",
         description=current_context['concept_description'],
         tags=current_context['concept_tags'],
-        question=question,
+        question=apply_memory_question_expansion(question, memory_context),
         columns=current_context['columns_str'],
         measures_context=current_context['measures_context'],
         transitive_context=current_context['transitive_context'],
@@ -1718,9 +1886,11 @@ def handle_generate_sql_reasoning(
     metadata_context_max_tokens: Optional[int] = None,
     max_graph_depth: Optional[int] = None,
     include_logic_concepts: Optional[bool] = None,
+    memory_context=None,
+    rules=None,
 ) -> tuple[str, int, str, int]:
     import time as _time
-    generate_sql_prompt = get_generate_sql_prompt_template(conn_params)
+    generate_sql_prompt = get_generate_sql_prompt_template(conn_params, True)
     context_graph_depth = graph_depth
     reasoned_sql = sql_query
     reasoned_sql_reason = None
@@ -1740,6 +1910,9 @@ def handle_generate_sql_reasoning(
                 note=note,
                 generate_sql_reason=generate_sql_reason,
                 decisions=decisions,
+                memory_context=memory_context,
+                rules=rules,
+                concept=concept,
             )
             
             usage_metadata[f'sql_reasoning_step_{step + 1}'] = {
@@ -1758,11 +1931,10 @@ def handle_generate_sql_reasoning(
             evaluation_note = note + f"\n\nThe previously generated SQL: `{reasoned_sql}` was assessed as '{evaluation.get('assessment')}' because: {reasoned_sql_reason or '*could not determine cause*'}. Please provide a corrected SQL query that better answers the question: '{question}'.\n\nCRITICAL: Return ONLY the SQL query without any explanation or comments."
             
             # Increase graph depth for 2nd+ reasoning attempts, up to max of 3
-            max_context_graph_depth = 3
-            context_graph_depth = min(max_context_graph_depth, graph_depth)
+            context_graph_depth = min(max_graph_depth, graph_depth)
 
-            if (step >= 1 and type(previous_token_count) == int and previous_token_count > 0 and previous_token_count < 20000):
-                context_graph_depth = min(max_context_graph_depth, context_graph_depth + 1)
+            if (metadata_context_mode == "static" and step >= 1 and type(max_graph_depth) == int and previous_token_count > 0 and previous_token_count < 20000):
+                context_graph_depth = min(max_graph_depth, context_graph_depth + 1)
 
             regen_result = _generate_sql_with_llm(
                 question=question,
@@ -1789,10 +1961,12 @@ def handle_generate_sql_reasoning(
                     max_graph_depth=max_graph_depth,
                     include_logic_concepts=include_logic_concepts,
                     note=evaluation_note,
+                    memory_context=memory_context,
                 ),
                 note=evaluation_note,
                 timeout=timeout,
                 debug=debug,
+                memory_context=memory_context,
             )
 
             reasoned_sql = regen_result['sql']
@@ -1857,6 +2031,7 @@ def handle_validate_generate_sql(
     # prompts so the validation-retry regeneration sees the same prior-turn
     # context the original generate_sql call did.
     note: Optional[str] = None,
+    memory_context=None,
 ) -> tuple[bool, str, str]:
     is_sql_valid, error, sql_query = validate_sql(sql_query, conn_params)
     validation_attempt = 0
@@ -1890,10 +2065,12 @@ def handle_validate_generate_sql(
                 max_graph_depth=max_graph_depth,
                 include_logic_concepts=include_logic_concepts,
                 note=note,
+                memory_context=memory_context,
             ),
             note=validation_err_txt,
             timeout=timeout,
             debug=debug,
+            memory_context=memory_context,
         )
         
         regen_error = regen_result['error']
@@ -1945,6 +2122,8 @@ def generate_sql(
         metadata_context_mode: Optional[str] = None,
         metadata_context_max_tokens: Optional[int] = None,
         max_graph_depth: Optional[int] = None,
+        enable_ontology_questions: Optional[bool] = False,
+        rules: Optional[RuleSet] = None,
     ) -> dict[str, str]:
     usage_metadata = {}
     concept_metadata = None
@@ -1955,13 +2134,25 @@ def generate_sql(
     if timeout is None:
         timeout = config.llm_timeout
 
-    # Inject memory context into note
-    if memory_context is not None:
-        from .memory import format_memory_note_for_sql
-        memory_note = format_memory_note_for_sql(memory_context)
-        if memory_note:
-            note = (memory_note + '\n' + note) if note else memory_note
-    
+    # Short-circuit when the metadata concept was already identified upstream: emit the
+    # real best-effort snapshot query without running concept-based SQL generation.
+    if ontology_metadata.is_metadata_concept(concept):
+        return {
+            "sql": ontology_metadata.BASE_SQL,
+            "concept": ontology_metadata.META,
+            "schema": schema or 'dtimbr',
+            "error": None,
+            "is_sql_valid": True if should_validate_sql else None,
+            "identify_concept_reason": None,
+            "generate_sql_reason": None,
+            "reasoning_status": reasoning_status,
+            "reasoning_duration": reasoning_duration,
+            "identify_concept_chain_duration": 0,
+            "usage_metadata": usage_metadata,
+            "ontology": ontology_metadata.parse_ontology(concept, default=conn_params.get('ontology')),
+            "conn_params": conn_params,
+        }
+
     if concept and concept != "" and (schema is None or schema != "vtimbr"):
         concepts_list = [concept]
     elif concept and concept != "" and schema == "vtimbr":
@@ -1980,6 +2171,9 @@ def generate_sql(
         note=note,
         debug=debug,
         timeout=timeout,
+        memory_context=memory_context,
+        enable_ontology_questions=enable_ontology_questions,
+        rules=rules,
     )
 
     identify_concept_chain_duration = determine_concept_res.pop("duration_ms", 0)
@@ -1996,7 +2190,33 @@ def generate_sql(
     if not concept:
         raise Exception("No relevant concept found for the query.")
 
-    generate_sql_prompt = get_generate_sql_prompt_template(conn_params)
+    # Inject memory context into note
+    if memory_context is not None:
+        from .memory import format_memory_note_for_sql
+        memory_note = format_memory_note_for_sql(memory_context)
+        if memory_note:
+            note = (memory_note + '\n' + note) if note else memory_note
+
+    # Metadata concept identified during this call: emit the best-effort snapshot query.
+    # execute() recognizes the concept and expands it to the full sys_* row set.
+    if ontology_metadata.is_metadata_concept(concept):
+        return {
+            "sql": ontology_metadata.BASE_SQL,
+            "concept": ontology_metadata.META,
+            "schema": schema or 'dtimbr',
+            "error": None,
+            "is_sql_valid": True if should_validate_sql else None,
+            "identify_concept_reason": identify_concept_reason,
+            "generate_sql_reason": None,
+            "reasoning_status": reasoning_status,
+            "reasoning_duration": reasoning_duration,
+            "identify_concept_chain_duration": identify_concept_chain_duration,
+            "usage_metadata": usage_metadata,
+            "ontology": determine_concept_res.get('ontology') or conn_params.get('ontology'),
+            "conn_params": conn_params,
+        }
+
+    generate_sql_prompt = get_generate_sql_prompt_template(conn_params, enable_reasoning)
     sql_query = None
     generate_sql_reason = None
     is_sql_valid = True  # Assume valid by default; set to False only if validation fails
@@ -2028,10 +2248,13 @@ def generate_sql(
                 max_graph_depth=max_graph_depth,
                 include_logic_concepts=include_logic_concepts,
                 note=note,
+                memory_context=memory_context,
+                rules=rules,
             ),
             note=note,
             timeout=timeout,
             debug=debug,
+            memory_context=memory_context,
         )
 
         usage_metadata['generate_sql'] = {
@@ -2079,6 +2302,8 @@ def generate_sql(
                 metadata_context_max_tokens=metadata_context_max_tokens,
                 max_graph_depth=max_graph_depth,
                 include_logic_concepts=include_logic_concepts,
+                memory_context=memory_context,
+                rules=rules,
             )
 
         if should_validate_sql or enable_reasoning:
@@ -2111,6 +2336,7 @@ def generate_sql(
                 max_graph_depth=max_graph_depth,
                 include_logic_concepts=include_logic_concepts,
                 note=note,
+                memory_context=memory_context,
             )
     except TimeoutError as e:
         error = f"LLM call timed out: {str(e)}"
@@ -2147,6 +2373,8 @@ def answer_question(
     note: Optional[str] = '',
     debug: Optional[bool] = False,
     memory_context=None,
+    identify_concept_reason: Optional[str] = None,
+    generate_sql_reason: Optional[str] = None
 ) -> dict[str, Any]:
     # Use config default timeout if none provided
     if timeout is None:
@@ -2156,6 +2384,13 @@ def answer_question(
 
     # Build additional_context with optional memory
     additional_context = f"SQL QUERY:\n{sql}\n\n" if sql else ""
+    
+    if identify_concept_reason:
+        additional_context += f"Concept selection reasoning:\n{identify_concept_reason}\n\n"
+    
+    if generate_sql_reason:
+        additional_context += f"Generate SQL Reasoning:\n{generate_sql_reason}\n\n"
+
     if memory_context is not None:
         from .memory import format_memory_note_for_answer
         memory_note = format_memory_note_for_answer(memory_context)
@@ -2163,7 +2398,7 @@ def answer_question(
             additional_context = memory_note + "\n\n" + additional_context
 
     prompt = qa_prompt.format_messages(
-        question=question,
+        question=apply_memory_question_expansion(question, memory_context),
         formatted_rows=results,
         additional_context=additional_context,
         note=note,
