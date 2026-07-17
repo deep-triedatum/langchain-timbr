@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from typing import Optional, Any, Union
 from langchain_core.language_models.llms import LLM
 from langchain_core.runnables import Runnable
@@ -7,6 +8,25 @@ try:
     _LANGSMITH_AVAILABLE = True
 except ImportError:
     _LANGSMITH_AVAILABLE = False
+
+try:
+    from langfuse import observe as lf_observe, get_client as lf_get_client, propagate_attributes as lf_propagate_attributes
+except ImportError:
+    lf_get_client = None
+    lf_propagate_attributes = None
+    def lf_observe(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        def decorator(func):
+            return func
+        return decorator
+
+try:
+    from langfuse.langchain import CallbackHandler as LfCallbackHandler
+except ImportError:
+    LfCallbackHandler = None
+
+_LANGFUSE_AVAILABLE = LfCallbackHandler is not None
 
 from ..utils.general import parse_list, to_boolean, to_integer, sanitize_results
 from .execute_timbr_query_chain import ExecuteTimbrQueryChain
@@ -210,6 +230,9 @@ class TimbrSqlAgent(Runnable):
                 metadata_context_max_tokens=to_integer(metadata_context_max_tokens),
             )
 
+        if _LANGFUSE_AVAILABLE:
+            self._setup_langfuse_tracing()
+
 
     @property
     def output_keys(self) -> list:
@@ -309,19 +332,114 @@ class TimbrSqlAgent(Runnable):
             "chain_context": result.get("chain_context"),
         })
 
+    def _setup_langfuse_tracing(self):
+        """Setup Langfuse CallbackHandler for LLMs in the chain."""
+        if not _LANGFUSE_AVAILABLE:
+            return
 
+        def register(llm_obj):
+            if llm_obj is None:
+                return
+            try:
+                handler = LfCallbackHandler()
+                if hasattr(llm_obj, "callbacks"):
+                    if llm_obj.callbacks is None:
+                        llm_obj.callbacks = []
+                    if not any(isinstance(c, LfCallbackHandler) for c in llm_obj.callbacks):
+                        llm_obj.callbacks.append(handler)
+                if hasattr(llm_obj, "client") and llm_obj.client:
+                    if hasattr(llm_obj.client, "callbacks"):
+                        if llm_obj.client.callbacks is None:
+                            llm_obj.client.callbacks = []
+                        if not any(isinstance(c, LfCallbackHandler) for c in llm_obj.client.callbacks):
+                            llm_obj.client.callbacks.append(handler)
+            except Exception:
+                pass
+
+        if hasattr(self, "_chain") and self._chain:
+            if hasattr(self._chain, "_llm"):
+                register(self._chain._llm)
+            if hasattr(self._chain, "_execute_chain") and self._chain._execute_chain:
+                if hasattr(self._chain._execute_chain, "_llm"):
+                    register(self._chain._execute_chain._llm)
+
+    def _add_langfuse_callback(self, config: Optional[dict], conversation_id: Optional[str] = None) -> dict:
+        """Add Langfuse CallbackHandler and session ID to LangChain config."""
+        if not _LANGFUSE_AVAILABLE:
+            return config or {}
+
+        if config is None:
+            config = {}
+        else:
+            config = dict(config)
+
+        callbacks = config.get("callbacks")
+        if callbacks is None:
+            callbacks = []
+        else:
+            callbacks = list(callbacks)
+
+        if not any(isinstance(c, LfCallbackHandler) for c in callbacks):
+            try:
+                callbacks.append(LfCallbackHandler())
+            except Exception:
+                pass
+        config["callbacks"] = callbacks
+
+        metadata = dict(config.get("metadata") or {})
+        if conversation_id:
+            metadata["langfuse_session_id"] = conversation_id
+        metadata["langfuse_tags"] = list(metadata.get("langfuse_tags") or []) + [
+            "generate_answer" if self._generate_answer else "execute_query",
+        ]
+        config["metadata"] = metadata
+
+        return config
+
+    @contextmanager
+    def _langfuse_trace(self, user_input: str, conversation_id: Optional[str]):
+        """Attach session_id/tags to the trace and explicitly set input/output to the
+        user-facing prompt/result, instead of leaking `self` and the full LangChain
+        `config` (which may carry secrets) via the @observe decorator's default capture."""
+        if not _LANGFUSE_AVAILABLE or lf_get_client is None or lf_propagate_attributes is None:
+            yield None
+            return
+
+        tags = ["generate_answer" if self._generate_answer else "execute_query"]
+        with lf_propagate_attributes(session_id=conversation_id, tags=tags):
+            client = lf_get_client()
+            try:
+                client.update_current_span(input={"input": user_input, "conversation_id": conversation_id})
+            except Exception:
+                pass
+            yield client
+
+    @lf_observe(name="TimbrSqlAgent", capture_input=False, capture_output=False)
     def invoke(
         self, input: dict, config=None, **kwargs: Any
     ) -> dict:
         """Run the agent and return results."""
-        if _LANGSMITH_AVAILABLE:
-            with ls_trace(name="TimbrSqlAgent", run_type="chain", inputs={"input": input}) as rt:
-                result = self._invoke_impl(input)
-                rt.end(outputs=result)
-                return result
-        return self._invoke_impl(input)
+        user_input = input.get("input", "") if isinstance(input, dict) else input
+        _conversation_id = (input.get("conversation_id") if isinstance(input, dict) else None) or self._conversation_id
+        config = self._add_langfuse_callback(config, _conversation_id)
 
-    def _invoke_impl(self, input: dict) -> dict:
+        with self._langfuse_trace(user_input, _conversation_id) as lf_client:
+            if _LANGSMITH_AVAILABLE:
+                with ls_trace(name="TimbrSqlAgent", run_type="chain", inputs={"input": input}) as rt:
+                    result = self._invoke_impl(input, config=config)
+                    rt.end(outputs=result)
+            else:
+                result = self._invoke_impl(input, config=config)
+
+            if lf_client is not None:
+                try:
+                    lf_client.update_current_span(output=result)
+                except Exception:
+                    pass
+
+        return result
+
+    def _invoke_impl(self, input: dict, config=None) -> dict:
         user_input = input.get("input", "") if isinstance(input, dict) else input
 
         if not user_input or not user_input.strip():
@@ -332,7 +450,7 @@ class TimbrSqlAgent(Runnable):
         _log_ctx, _delegated_ctx = self._setup_log_contexts(user_input, _conversation_id)
 
         try:
-            result = self._chain.invoke({"prompt": user_input, "conversation_id": _conversation_id, "chain_context": _chain_context}, log_ctx=_delegated_ctx)
+            result = self._chain.invoke({"prompt": user_input, "conversation_id": _conversation_id, "chain_context": _chain_context}, config=config, log_ctx=_delegated_ctx)
             if result.get('conversation_id') != _conversation_id:
                 _conversation_id = result.get('conversation_id')
 
@@ -347,18 +465,32 @@ class TimbrSqlAgent(Runnable):
         except Exception as e:
             return self._get_error_response(str(e), _conversation_id)
 
+    @lf_observe(name="TimbrSqlAgent", capture_input=False, capture_output=False)
     async def ainvoke(
         self, input: dict, config=None, **kwargs: Any
     ) -> dict:
         """Async version of invoke."""
-        if _LANGSMITH_AVAILABLE:
-            with ls_trace(name="TimbrSqlAgent", run_type="chain", inputs={"input": input}) as rt:
-                result = await self._ainvoke_impl(input)
-                rt.end(outputs=result)
-                return result
-        return await self._ainvoke_impl(input)
+        user_input = input.get("input", "") if isinstance(input, dict) else input
+        _conversation_id = (input.get("conversation_id") if isinstance(input, dict) else None) or self._conversation_id
+        config = self._add_langfuse_callback(config, _conversation_id)
 
-    async def _ainvoke_impl(self, input: dict) -> dict:
+        with self._langfuse_trace(user_input, _conversation_id) as lf_client:
+            if _LANGSMITH_AVAILABLE:
+                with ls_trace(name="TimbrSqlAgent", run_type="chain", inputs={"input": input}) as rt:
+                    result = await self._ainvoke_impl(input, config=config)
+                    rt.end(outputs=result)
+            else:
+                result = await self._ainvoke_impl(input, config=config)
+
+            if lf_client is not None:
+                try:
+                    lf_client.update_current_span(output=result)
+                except Exception:
+                    pass
+
+        return result
+
+    async def _ainvoke_impl(self, input: dict, config=None) -> dict:
         user_input = input.get("input", "") if isinstance(input, dict) else input
 
         if not user_input or not user_input.strip():
@@ -370,9 +502,9 @@ class TimbrSqlAgent(Runnable):
 
         try:
             if hasattr(self._chain, 'ainvoke'):
-                result = await self._chain.ainvoke({"prompt": user_input, "conversation_id": _conversation_id, "chain_context": _chain_context}, log_ctx=_delegated_ctx)
+                result = await self._chain.ainvoke({"prompt": user_input, "conversation_id": _conversation_id, "chain_context": _chain_context}, config=config, log_ctx=_delegated_ctx)
             else:
-                result = self._chain.invoke({"prompt": user_input, "conversation_id": _conversation_id, "chain_context": _chain_context}, log_ctx=_delegated_ctx)
+                result = self._chain.invoke({"prompt": user_input, "conversation_id": _conversation_id, "chain_context": _chain_context}, config=config, log_ctx=_delegated_ctx)
 
             if result.get('conversation_id') != _conversation_id:
                 _conversation_id = result.get('conversation_id')
@@ -387,6 +519,7 @@ class TimbrSqlAgent(Runnable):
             return self._build_result(result, _conversation_id, _log_ctx, _delegated_ctx)
         except Exception as e:
             return self._get_error_response(str(e), _conversation_id)
+
 
 
 def create_timbr_sql_agent(
